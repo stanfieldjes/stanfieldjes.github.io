@@ -562,6 +562,15 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
      1px border on a zero-height row so it doesn't shift any text. */
   .yt-marker td{padding:0; height:0; line-height:0;}
   .yt-payline{height:0; border-top:1px solid var(--line); margin:3px -10px;}
+  .ys-tax{margin-top:8px; padding-top:8px; border-top:1px dashed var(--line);}
+  .ys-tax-head{display:flex; align-items:center; gap:6px; margin-bottom:6px;}
+  .ys-tax-head .ysg-lbl{flex:1; color:var(--subtext); font-size:10px;
+    text-transform:uppercase; letter-spacing:.3px;}
+  .ys-tax-head input[type=checkbox]{cursor:pointer;}
+  .ys-tax-total{display:flex; justify-content:space-between; align-items:center;
+    font:12px/1.4 Consolas,Menlo,monospace; font-weight:700; margin-top:5px;
+    padding-top:5px; border-top:1px solid var(--line); color:var(--text);}
+  .ys-tax-total .amt{color:var(--yellow);}
 
   /* Selected-player panel (click a bar segment) */
   .player-panel{
@@ -719,6 +728,11 @@ const GROWTH={};
 function growthFor(year){
   return (GROWTH[year]!==undefined && !isNaN(GROWTH[year])) ? GROWTH[year] : DEFAULT_GROWTH;
 }
+// year -> is this team a repeater taxpayer that season (3+ tax seasons in the
+// last 4)? Defaults to false (standard rate); toggled per-year in the
+// yearly-summary tax bill panel since the app doesn't track tax history.
+const REPEATER={};
+function repeaterFor(year){ return !!REPEATER[year]; }
 let THRESHOLDS={};
 function recomputeThresholds(){
   const out={}; out[BASE_YEAR]=BASE_THRESHOLDS.slice();
@@ -813,6 +827,38 @@ const STATUS_RGB={
 };
 const REF_LINES=[["Salary Cap",0,"#20C940"],["Luxury Tax",1,"#C9B820"],
                  ["1st Apron",2,"#C97820"],["2nd Apron",3,"#C93040"]];
+
+// ── Luxury tax bill ─────────────────────────────────────────────────
+// Marginal brackets on the amount OVER the tax line, $5M wide. The first
+// four brackets are the published rates; every $5M bracket beyond $20M
+// keeps stepping both columns up by $0.50 (preserving the $2.00 repeater
+// spread already present in the published table).
+const TAX_BRACKET_SIZE=5;     // $ millions per bracket
+const TAX_STEP_BEYOND=0.50;   // rate increase per additional bracket beyond $20M
+const TAX_BRACKETS=[
+  {std:1.25, rep:3.25},  // $0M   – $5M  over the tax line
+  {std:1.75, rep:3.75},  // $5M   – $10M
+  {std:2.50, rep:4.50},  // $10M  – $15M
+  {std:3.25, rep:5.25},  // $15M  – $20M
+];
+function taxBracketRates(i){
+  if(i<TAX_BRACKETS.length) return TAX_BRACKETS[i];
+  const extra=i-TAX_BRACKETS.length+1, last=TAX_BRACKETS[TAX_BRACKETS.length-1];
+  return {std:last.std+TAX_STEP_BEYOND*extra, rep:last.rep+TAX_STEP_BEYOND*extra};
+}
+// Full marginal breakdown of the tax bill for `overM` dollars (in $ millions)
+// over the tax line. Returns {total, rows:[{lo,hi,rate,amt,tax}]}, both in $M.
+function luxuryTaxBreakdown(overM, isRepeater){
+  const rows=[]; let remaining=Math.max(0,overM||0), total=0, i=0;
+  while(remaining>0.0001){
+    const {std,rep}=taxBracketRates(i), rate=isRepeater?rep:std;
+    const lo=i*TAX_BRACKET_SIZE, amt=Math.min(remaining,TAX_BRACKET_SIZE);
+    const tax=amt*rate;
+    rows.push({lo, hi:lo+TAX_BRACKET_SIZE, rate, amt, tax});
+    total+=tax; remaining-=amt; i++;
+  }
+  return {total, rows};
+}
 
 /* ════ DATA LAYER ════ */
 function parseSalary(v){v=(v||"").trim().replace(/[$,]/g,""); return v?parseFloat(v):null;}
@@ -1656,7 +1702,8 @@ function syncYearSlider(){
 
 function refreshTotals(){
   const box=$("totals"); box.innerHTML="";
-  for(const r of ST.yearlySummary()){
+  const summaryRows=ST.yearlySummary();
+  summaryRows.forEach((r,idx)=>{
     const lineClr=STATUS_COLOR[r.status]||SUBTEXT;
     const rgb=STATUS_RGB[r.status]||"138,138,138";
     const expanded=expandedYears.has(r.yc);
@@ -1674,10 +1721,13 @@ function refreshTotals(){
     if(expanded && r.breakdown){
       const body=document.createElement("div"); body.className="ys-body";
       const yr=parseInt(r.yc);
-      // Growth control: every year except the fixed 2025-26 base year derives
-      // its cap/tax/aprons from the prior year by this %.
+      // Growth control: shown for every displayed year EXCEPT the first one
+      // shown (idx===0), since there's no prior displayed year to grow from.
+      // This is about the displayed window, not the fixed real-world base
+      // year (BASE_YEAR), so it stays correct no matter where the slider
+      // window starts.
       let growthHTML="";
-      if(yr>BASE_YEAR){
+      if(idx>0){
         growthHTML=
           `<div class="ys-growth">`+
             `<span class="ysg-lbl">Increase vs prior year</span>`+
@@ -1685,7 +1735,7 @@ function refreshTotals(){
             `<span class="ysg-pct">%</span>`+
           `</div>`;
       }else{
-        growthHTML=`<div class="ys-growth"><span class="ysg-lbl">Base year (actual values)</span></div>`;
+        growthHTML=`<div class="ys-growth"><span class="ysg-lbl">First year shown (no prior year)</span></div>`;
       }
       let rows=growthHTML+`<table class="yt-table"><tbody>`;
       // The breakdown rows run high→low (2nd Apron … Salary Floor). The payroll
@@ -1694,9 +1744,10 @@ function refreshTotals(){
       // if it's over the 2nd apron, or the very bottom if it's under the floor).
       const markerHTML=
         `<tr class="yt-marker"><td colspan="4"><div class="yt-payline" style="border-color:rgba(${rgb},0.45)"></div></td></tr>`;
-      let markerPlaced=false;
+      let markerPlaced=false, overTaxM=0;
       for(const b of r.breakdown){
         const over=b.value>=0, dot=tierLineColor(b.label);
+        if(b.label==="Luxury Tax") overTaxM=b.value;   // amount over/under the tax line
         // Drop the marker just before the first line the payroll is above.
         if(over && !markerPlaced){ rows+=markerHTML; markerPlaced=true; }
         const arrow=over?"↑":"↓";
@@ -1709,8 +1760,26 @@ function refreshTotals(){
       // Under the floor → payroll is below every line; marker goes at the bottom.
       if(!markerPlaced) rows+=markerHTML;
       rows+=`</tbody></table>`;
-      body.innerHTML=rows;
-      if(yr>BASE_YEAR){
+
+      // Luxury tax bill: marginal brackets on the amount over the tax line,
+      // at either the standard or repeater rate (toggled per-year, since the
+      // app has no history of prior tax seasons to derive it automatically).
+      // Only the bill total and the combined cost are shown — not the
+      // bracket-by-bracket math.
+      const isRep=repeaterFor(yr);
+      const taxBillM=luxuryTaxBreakdown(overTaxM,isRep).total;
+      const totalCostM=r.total+taxBillM;
+      let taxHTML=`<div class="ys-tax">`+
+        `<div class="ys-tax-head">`+
+          `<span class="ysg-lbl">Repeater taxpayer</span>`+
+          `<input type="checkbox" id="repeater-${yr}"${isRep?" checked":""}>`+
+        `</div>`+
+        `<div class="ys-tax-total"><span>Luxury tax bill</span><span class="amt">$${taxBillM.toFixed(2)}M</span></div>`+
+        `<div class="ys-tax-total"><span>Total cost (salaries + tax)</span><span class="amt">$${totalCostM.toFixed(2)}M</span></div>`+
+      `</div>`;
+
+      body.innerHTML=rows+taxHTML;
+      if(idx>0){
         const inp=body.querySelector(`#growth-${yr}`);
         // Editing one year recompounds every later year too, so redraw fully.
         inp.onchange=()=>{
@@ -1721,10 +1790,13 @@ function refreshTotals(){
         // Don't let a click on the input collapse the cell.
         inp.onclick=e=>e.stopPropagation();
       }
+      const repChk=body.querySelector(`#repeater-${yr}`);
+      repChk.onchange=()=>{ REPEATER[yr]=repChk.checked; refreshTotals(); };
+      repChk.onclick=e=>e.stopPropagation();
       cell.appendChild(body);
     }
     box.appendChild(cell);
-  }
+  });
   if(!box.children.length) box.innerHTML='<div class="muted">No data.</div>';
 }
 function tierLineColor(label){
